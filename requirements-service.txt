@@ -1,0 +1,29 @@
+# Self-contained deps for running service.py (the video-stream analysis
+# service). Deliberately NOT layered on top of requirements.txt: that file
+# is a raw `pip freeze` of someone else's conda environment (246 lines,
+# includes unresolvable local conda build paths like
+# `archspec @ file:///home/conda/...`) and fails outright under plain pip
+# install -- confirmed by trying it. This file lists only what this repo's
+# code actually imports (facetracking.py/obd.py/vad.py/service.py), pinned
+# loosely (compatible-release, not exact) so pip can resolve current
+# wheels rather than someone else's frozen-at-a-point-in-time versions.
+#
+# Install: pip install -r requirements-service.txt
+
+mediapipe>=0.10.14
+# torch~=2.2 (the newest available for this platform/Python -- torch>=2.3
+# has no matching distribution here, confirmed by trying it) was built
+# against NumPy 1.x and prints a real "may crash" ABI-mismatch warning
+# under numpy 2 (also confirmed by trying it). opencv-python 4.10+ requires
+# numpy>=2, so pinning numpy<2 means pinning an older opencv-python too --
+# 4.9.x is the last line still built against NumPy 1.x.
+opencv-python~=4.9.0
+numpy<2
+silero-vad~=6.2
+torch~=2.2
+torchaudio~=2.2
+ultralytics~=8.3
+pyaudio~=0.2.14
+fastapi~=0.116
+uvicorn[standard]~=0.35
+websockets~=16.0

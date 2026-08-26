@@ -106,6 +106,26 @@ class PoseResult:
     gaze_x:     float   # normalized horizontal iris offset  ≈ -1 … +1
     gaze_y:     float   # normalized vertical   iris offset  ≈ -1 … +1
     face_found: bool = True
+    # Optional, additive fields for the video-stream/AI_ANALYSIS pipeline
+    # (shepherd-backend's video-stream-relay.ts / proctor-ai's service.py) --
+    # default to None/1 so every existing caller (main.py, the local demo)
+    # keeps working unchanged when num_faces=1 (the HeadPoseEstimator default).
+    face_bounding_box: Optional[dict] = None
+    num_faces: int = 1
+
+
+def gaze_bucket(gaze_x: float, gaze_y: float, threshold: float = 0.35) -> str:
+    """
+    Buckets a continuous (gaze_x, gaze_y) offset into one of the discrete
+    directions API_CONTRACTS.md §3's AI_ANALYSIS.gaze_direction expects
+    ("CENTER"/"LEFT"/"RIGHT"/"UP"/"DOWN"). Whichever axis is furthest past
+    threshold wins; ties/near-center collapse to CENTER.
+    """
+    if abs(gaze_x) < threshold and abs(gaze_y) < threshold:
+        return "CENTER"
+    if abs(gaze_x) >= abs(gaze_y):
+        return "RIGHT" if gaze_x > 0 else "LEFT"
+    return "DOWN" if gaze_y > 0 else "UP"
 
 
 # ---------------------------------------------------------------------------
@@ -123,16 +143,17 @@ class HeadPoseEstimator:
     """
 
     def __init__(self, frame_width: int, frame_height: int,
-                 smoothing_alpha: float = 0.3):
+                 smoothing_alpha: float = 0.3, num_faces: int = 1):
         self.w = frame_width
         self.h = frame_height
+        self._num_faces = num_faces
 
         options = vision.FaceLandmarkerOptions(
             base_options=python.BaseOptions(
                 model_asset_path=str(ensure_model())
             ),
             running_mode=vision.RunningMode.VIDEO,
-            num_faces=1,
+            num_faces=num_faces,
             min_face_detection_confidence=0.5,
             min_face_presence_confidence=0.5,
             min_tracking_confidence=0.5,
@@ -159,9 +180,9 @@ class HeadPoseEstimator:
         result = self._landmarker.detect_for_video(mp_image, timestamp_ms)
 
         if not result.face_landmarks:
-            return PoseResult(0.0, 0.0, 0.0, 0.0, 0.0, face_found=False)
+            return PoseResult(0.0, 0.0, 0.0, 0.0, 0.0, face_found=False, num_faces=0)
 
-        landmarks = result.face_landmarks[0]  # NormalizedLandmark list
+        landmarks = result.face_landmarks[0]  # NormalizedLandmark list -- primary face
 
         # Head pose -- directly from the 4×4 rigid-body transform matrix.
         # Top-left 3×3 sub-matrix is the rotation component.
@@ -170,13 +191,31 @@ class HeadPoseEstimator:
 
         gaze_x, gaze_y = self._estimate_gaze(landmarks)
 
+        # Only computed when num_faces>1 was requested (the AI_ANALYSIS
+        # pipeline's faces_detected/face_bounding_box fields) -- the local
+        # demo (num_faces=1, main.py) never needs these, so skip the extra
+        # work in that path.
+        bounding_box = None
+        if self._num_faces > 1:
+            bounding_box = self._bounding_box(landmarks)
+
         return PoseResult(
             yaw    = self._yaw.update(yaw),
             pitch  = self._pitch.update(pitch),
             roll   = self._roll.update(roll),
             gaze_x = self._gx.update(gaze_x),
             gaze_y = self._gy.update(gaze_y),
+            face_bounding_box = bounding_box,
+            num_faces = len(result.face_landmarks),
         )
+
+    def _bounding_box(self, landmarks) -> dict:
+        """Pixel-space bounding box (x, y, width, height) from a landmark list's min/max extent."""
+        xs = [lm.x * self.w for lm in landmarks]
+        ys = [lm.y * self.h for lm in landmarks]
+        x_min, x_max = min(xs), max(xs)
+        y_min, y_max = min(ys), max(ys)
+        return {"x": x_min, "y": y_min, "width": x_max - x_min, "height": y_max - y_min}
 
     # ------------------------------------------------------------------
     # Internal helpers
