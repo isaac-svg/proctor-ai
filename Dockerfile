@@ -1,13 +1,18 @@
 # syntax=docker/dockerfile:1
 FROM python:3.11-slim
 
-ENV PYTHONUNBUFFERED=1 \
+# Logs: one JSON object per line on stdout (LOG_LEVEL=debug|info|warning|error).
+ENV LOG_LEVEL=info \
+    LOG_FORMAT=json \
+    PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1
 
-# OpenCV / MediaPipe runtime libraries.
+# OpenCV / MediaPipe runtime libraries. MediaPipe's native library links against
+# EGL and GLES: without libegl1 / libgles2 the image builds and starts, and then
+# every session fails on "libEGL.so.1: cannot open shared object file".
 RUN apt-get update \
- && apt-get install -y --no-install-recommends libgl1 libglib2.0-0 libsm6 libxext6 libxrender1 \
+ && apt-get install -y --no-install-recommends libgl1 libegl1 libgles2 libglib2.0-0 libsm6 libxext6 libxrender1 \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
