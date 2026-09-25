@@ -144,9 +144,11 @@ def test_two_concurrent_sessions_do_not_cross_contaminate_state():
 
 
 def test_health_reports_which_capabilities_are_really_loaded(client):
-    body = client.get("/health").json()
-    assert body["status"] == "OK"
-    assert set(body["capabilities"]) == {"identity", "speaker_diarization", "objects"}
+    response = client.get("/health")
+    body = response.json()
+    assert body["status"] in ("OK", "LOADING", "DEGRADED")
+    assert response.status_code == 200
+    assert set(body["capabilities"]) == {"face_tracking", "identity", "speaker_diarization", "objects"}
     assert body["models"] in ("loading", "ready")
 
 

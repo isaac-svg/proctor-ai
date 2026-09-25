@@ -31,11 +31,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: docker build -t proctor-ai:ci .
-      - name: Service starts and reports health
+      - name: Service starts, finishes loading and reports healthy
         run: |
           docker run -d --name ai -p 8901:8901 proctor-ai:ci
-          for i in $(seq 1 60); do curl -fsS localhost:8901/health && break || sleep 3; done
-          curl -fsS localhost:8901/health
+          # /health answers 200 "LOADING" while models load and 503 "FAILED" when a
+          # capability the service cannot work without is missing (for example a
+          # system library the image forgot), so wait for "ready" and then require
+          # a usable status, not just an HTTP response.
+          body=""
+          for i in $(seq 1 90); do
+            body="$(curl -s localhost:8901/health || true)"
+            echo "$body" | grep -q '"models":"ready"' && break
+            sleep 3
+          done
+          echo "$body"
+          if ! echo "$body" | grep -Eq '"status":"(OK|DEGRADED)"'; then
+            echo "::error::analysis service is not healthy"; docker logs ai; exit 1
+          fi
+          echo "$body" | grep -q '"face_tracking":true' || { echo "::error::face tracking unavailable"; docker logs ai; exit 1; }
 
   publish:
     # Publishes the image to GitHub Container Registry for Coolify to pull.

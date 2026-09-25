@@ -142,3 +142,35 @@ with defaults that preserve old behavior, or new files):
   frame sampling; at ~1 snapshot/sec (shepherd-ai's default `snapshot_interval_ms`) a 2.5s
   "sustained look-away" threshold only gets 2-3 samples to confirm against. Revisit the cadence
   after a first end-to-end test.
+
+
+## Logging
+
+One JSON object per line on stdout:
+
+```json
+{"time":"2026-09-25T15:20:59.509+00:00","level":"info","logger":"proctor-ai","msg":"session_closed","session_id":"df760e74-...","reason":"client_requested","duration_seconds":1834.2,"frames":1810,"alerts":{"FACE_ABSENT":2},"slow_frames":0}
+```
+
+| Setting | Values | Default |
+| --- | --- | --- |
+| `LOG_LEVEL` | `debug` `info` `warning` `error` | `info` |
+| `LOG_FORMAT` | `json` `text` | `json` (`text` when run in a terminal) |
+| `SLOW_FRAME_SECONDS` | number | `1.5`: a frame slower than this is logged as `slow_frame` |
+
+Every line inside a session carries its `session_id` automatically.
+
+| Event | Level | Meaning |
+| --- | --- | --- |
+| `service_starting` / `warm_up_finished` | info / error | Startup, with which capabilities loaded and which did not. `error` if one the service cannot work without is missing |
+| `session_connected` / `session_closed` | info | One per session; the summary has duration, frames, audio chunks, alerts by type, slow and invalid messages, and why it ended |
+| `session_create_failed` | error | The session could not start (for example a missing system library). Once, with the cause; the caller gets close code 1011 |
+| `alert_emitted` | info | Each alert: type, severity, confidence, whether it had evidence |
+| `enrollment_result` | info | Outcome only: ok, reason, faces seen. Never the images or the embedding |
+| `slow_frame` | warn | The machine is overloaded and analysis is falling behind |
+
+A fault that repeats every frame is logged once, with `suppressed_repeats` on the next line that gets through. Uncaught exceptions (main thread, worker threads) are logged as structured errors. `/health` requests are not written to the access log.
+
+**`/health` tells the truth.** `OK` (200), `LOADING` (200, models still loading), `DEGRADED` (200, an optional capability such as speaker separation is missing; see `errors`), or `FAILED` (**503**, face tracking is missing, so no session could work). It also reports `active_sessions`, `uptime_seconds` and counters.
+
+**What is never logged:** frames, audio, embeddings, tokens or passwords (sensitive names are redacted; bytes are logged as sizes).

@@ -98,6 +98,7 @@ class SharedModels:
 
     def warm_up(self) -> None:
         """Load everything now, so the first real frame doesn't pay for it."""
+        self._check_face_tracking()
         _ = self.identity
         _ = self.speaker
         try:
@@ -108,8 +109,26 @@ class SharedModels:
             self.errors["objects"] = str(exc)
             log.warning("object detection unavailable: %s", exc)
 
+    def _check_face_tracking(self) -> None:
+        """Builds (and discards) one face tracker at startup. This is what the
+        first candidate connection would otherwise discover: MediaPipe loads a
+        native library, and a container missing a system library (libEGL, ...)
+        only fails at that moment. Finding out now turns "every session crashes
+        while /health says OK" into a startup error the health check reports."""
+        try:
+            from facetracking import HeadPoseEstimator
+
+            estimator = HeadPoseEstimator(640, 480, num_faces=1)
+            close = getattr(estimator, "close", None)
+            if callable(close):
+                close()
+        except Exception as exc:  # noqa: BLE001
+            self.errors["face_tracking"] = f"{type(exc).__name__}: {exc}"
+            log.error("face tracking unavailable: %s", exc, exc_info=True)
+
     def capabilities(self) -> Dict[str, bool]:
         return {
+            "face_tracking": "face_tracking" not in self.errors,
             "identity": self._identity is not None,
             "speaker_diarization": self._speaker is not None,
             "objects": "objects" not in self.errors,
