@@ -23,7 +23,16 @@ silero-vad~=6.2
 torch~=2.2
 torchaudio~=2.2
 ultralytics~=8.3
-pyaudio~=0.2.14
 fastapi~=0.116
 uvicorn[standard]~=0.35
 websockets~=16.0
+
+# Speaker embeddings for MULTIPLE_VOICES (speaker_embedding.py). Optional:
+# without it the service still runs and /health reports
+# capabilities.speaker_diarization = false.
+onnxruntime>=1.17
+
+# Only for the local demo (python main.py), which opens the machine's real
+# microphone via vad.py's open_stream=True path. The network service does not
+# need it -- and PortAudio is awkward to build on a server.
+# pyaudio~=0.2.14

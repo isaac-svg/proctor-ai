@@ -21,6 +21,7 @@ import pytest
 from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from fastapi.testclient import TestClient
 
@@ -114,6 +115,7 @@ def test_video_and_audio_frames_do_not_crash_and_produce_analysis(client):
 
 def test_two_concurrent_sessions_do_not_cross_contaminate_state():
     import session_manager
+    from helpers import frame, obj
 
     manager = session_manager.ProctorSessionManager()
     session_a = manager.get_or_create("session-a")
@@ -123,13 +125,48 @@ def test_two_concurrent_sessions_do_not_cross_contaminate_state():
     assert session_a.session_id == "session-a"
     assert session_b.session_id == "session-b"
 
-    # Feed different phone-detected state into each session's detector and
-    # confirm each session's own EventDetector/state stays independent.
-    session_a.state["isCellphone_detected"] = True
-    session_b.state["isCellphone_detected"] = False
-    assert session_a.state["isCellphone_detected"] is True
-    assert session_b.state["isCellphone_detected"] is False
+    # A phone confirmed in session A's rules must leave session B's untouched.
+    alerts_a = []
+    for t in range(3):
+        alerts_a += session_a.pipeline.on_frame(frame(float(t), objects=[obj("cell phone", 0.8)]))
+        session_b.pipeline.on_frame(frame(float(t)))
+    assert [a.alert_type for a in alerts_a] == ["CELLPHONE_DETECTED"]
+    assert "cell phone" in session_a.pipeline.objects.confirmed
+    assert "cell phone" not in session_b.pipeline.objects.confirmed
+
+    # Identity references are per session too.
+    assert session_a.set_reference([0.1] * 128)
+    assert session_a.has_reference and not session_b.has_reference
 
     manager.remove("session-a")
     manager.remove("session-b")
     assert manager.count() == 0
+
+
+def test_health_reports_which_capabilities_are_really_loaded(client):
+    body = client.get("/health").json()
+    assert body["status"] == "OK"
+    assert set(body["capabilities"]) == {"identity", "speaker_diarization", "objects"}
+    assert body["models"] in ("loading", "ready")
+
+
+def test_enroll_with_an_unusable_image_is_rejected_with_a_reason(client):
+    with client.websocket_connect("/analyze/precheck-smoke") as ws:
+        ws.send_json({"type": "ENROLL", "images": [base64.b64encode(synthetic_jpeg_bytes(size=(320, 240))).decode()]})
+        msg = ws.receive_json()
+        assert msg["type"] == "ENROLLMENT_RESULT"
+        assert msg["ok"] is False and msg["reason"] in ("no_face", "identity_unavailable")
+        assert msg["embedding"] is None
+
+
+def test_enroll_with_a_prior_embedding_sets_the_reference(client):
+    with client.websocket_connect("/analyze/precheck-smoke-2") as ws:
+        ws.send_json({"type": "ENROLL", "embedding": [0.05] * 128})
+        msg = ws.receive_json()
+        assert msg == {"type": "ENROLLMENT_RESULT", "ok": True, "reason": None, "embedding": None}
+
+
+def test_enroll_rejects_a_malformed_embedding(client):
+    with client.websocket_connect("/analyze/precheck-smoke-3") as ws:
+        ws.send_json({"type": "ENROLL", "embedding": ["x", "y"]})
+        assert ws.receive_json()["ok"] is False

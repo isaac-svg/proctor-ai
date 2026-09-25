@@ -15,7 +15,10 @@ as every other detector in this system already works.
 
 from __future__ import annotations
 
-from typing import Any, Dict, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Tuple
+
+if TYPE_CHECKING:
+    from observations import AlertEvent
 
 # event["type"] -> (alert_type, severity)
 ALERT_MAP: Dict[str, Tuple[str, str]] = {
@@ -60,3 +63,31 @@ def map_event(ev: Dict[str, Any]) -> Dict[str, Any] | None:
         "description": _DESCRIPTIONS.get(alert_type, alert_type.replace("_", " ").title()),
         "details": details,
     }
+
+
+# ---------------------------------------------------------------------------
+# Rules-layer events (pipeline.py). Unlike map_event() above, AlertEvent
+# already carries its own alert_type, severity and description -- severity is
+# decided per occurrence by the rule, not looked up from a table -- so this
+# is just serialisation.
+# ---------------------------------------------------------------------------
+
+
+def alert_to_message(session_id: str, ev: "AlertEvent", clip: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    """The AI_ALERT wire message (API_CONTRACTS.md §3) for one AlertEvent.
+    `clip`, when present, is the evidence attachment (evidence.py); the
+    backend's video-stream relay peels it off and stores it, so it never
+    travels on to the desktop app."""
+    msg: Dict[str, Any] = {
+        "type": "AI_ALERT",
+        "session_id": session_id,
+        "timestamp": int(ev.ts),
+        "alert_type": ev.alert_type,
+        "severity": ev.severity,
+        "confidence": ev.confidence,
+        "description": ev.description,
+        "details": dict(ev.details),
+    }
+    if clip is not None:
+        msg["evidence"] = clip
+    return msg

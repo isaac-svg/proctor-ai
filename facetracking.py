@@ -31,6 +31,7 @@ import numpy as np
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 from events import EventConfig, EventDetector, FLAG_COLORS, FLAG_LABELS
+from gaze import gaze_bucket  # noqa: F401  (re-exported; lives in gaze.py so rules stay model-free)
 
 
 # ---------------------------------------------------------------------------
@@ -112,20 +113,10 @@ class PoseResult:
     # keeps working unchanged when num_faces=1 (the HeadPoseEstimator default).
     face_bounding_box: Optional[dict] = None
     num_faces: int = 1
-
-
-def gaze_bucket(gaze_x: float, gaze_y: float, threshold: float = 0.35) -> str:
-    """
-    Buckets a continuous (gaze_x, gaze_y) offset into one of the discrete
-    directions API_CONTRACTS.md §3's AI_ANALYSIS.gaze_direction expects
-    ("CENTER"/"LEFT"/"RIGHT"/"UP"/"DOWN"). Whichever axis is furthest past
-    threshold wins; ties/near-center collapse to CENTER.
-    """
-    if abs(gaze_x) < threshold and abs(gaze_y) < threshold:
-        return "CENTER"
-    if abs(gaze_x) >= abs(gaze_y):
-        return "RIGHT" if gaze_x > 0 else "LEFT"
-    return "DOWN" if gaze_y > 0 else "UP"
+    # Normalized (0..1) boxes for *every* detected face, primary (largest)
+    # first -- what the multi-person and framing rules consume. Additive:
+    # None whenever no face was found.
+    face_boxes: Optional[list] = None
 
 
 # ---------------------------------------------------------------------------
@@ -182,19 +173,26 @@ class HeadPoseEstimator:
         if not result.face_landmarks:
             return PoseResult(0.0, 0.0, 0.0, 0.0, 0.0, face_found=False, num_faces=0)
 
-        landmarks = result.face_landmarks[0]  # NormalizedLandmark list -- primary face
+        # The primary face is the *largest* one, not whichever MediaPipe
+        # happens to list first -- with a second person in frame the list
+        # order is arbitrary, and head pose/gaze/identity must follow the
+        # person actually sitting at the desk.
+        boxes = [self._normalized_box(lm) for lm in result.face_landmarks]
+        areas = [b["width"] * b["height"] for b in boxes]
+        primary = max(range(len(boxes)), key=areas.__getitem__)
+        order = [primary] + [i for i in range(len(boxes)) if i != primary]
+        landmarks = result.face_landmarks[primary]
 
         # Head pose -- directly from the 4×4 rigid-body transform matrix.
         # Top-left 3×3 sub-matrix is the rotation component.
-        mat = np.array(result.facial_transformation_matrixes[0])
+        mat = np.array(result.facial_transformation_matrixes[primary])
         yaw, pitch, roll = rotation_matrix_to_euler(mat[:3, :3])
 
         gaze_x, gaze_y = self._estimate_gaze(landmarks)
 
-        # Only computed when num_faces>1 was requested (the AI_ANALYSIS
-        # pipeline's faces_detected/face_bounding_box fields) -- the local
-        # demo (num_faces=1, main.py) never needs these, so skip the extra
-        # work in that path.
+        # Pixel-space box, only when num_faces>1 was requested (the
+        # AI_ANALYSIS pipeline's face_bounding_box field) -- the local demo
+        # (num_faces=1, main.py) never needs it.
         bounding_box = None
         if self._num_faces > 1:
             bounding_box = self._bounding_box(landmarks)
@@ -207,7 +205,17 @@ class HeadPoseEstimator:
             gaze_y = self._gy.update(gaze_y),
             face_bounding_box = bounding_box,
             num_faces = len(result.face_landmarks),
+            face_boxes = [boxes[i] for i in order],
         )
+
+    @staticmethod
+    def _normalized_box(landmarks) -> dict:
+        """Normalized (0..1) box from a landmark list's min/max extent. May
+        extend slightly past 0..1 when a face is partly out of frame -- which
+        is exactly the signal the framing rule wants."""
+        xs = [lm.x for lm in landmarks]
+        ys = [lm.y for lm in landmarks]
+        return {"x": min(xs), "y": min(ys), "width": max(xs) - min(xs), "height": max(ys) - min(ys)}
 
     def _bounding_box(self, landmarks) -> dict:
         """Pixel-space bounding box (x, y, width, height) from a landmark list's min/max extent."""

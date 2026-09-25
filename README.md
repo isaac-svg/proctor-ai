@@ -11,6 +11,32 @@ checked out here as a sibling of [`shepherd-ai`](../shepherd-ai)/[`shepherd-back
 with the author before this code ships in a real product, independent of the technical integration
 below.
 
+## Architecture (service): perception → observations → rules
+
+The service is split in two so the interesting logic can be tested and tuned without any model:
+
+- **Perception** (`facetracking.py`, `obd.py`, `face_identity.py`, `vad.py`, `speaker_embedding.py`,
+  `frame_quality.py`, `audio_features.py`) — MediaPipe head pose/gaze, YOLO (people, phones, laptops,
+  books), OpenCV YuNet+SFace face recognition, Silero VAD, WeSpeaker speaker embeddings, plain image
+  and audio statistics. Turns one JPEG / one second of PCM into *observations* (`observations.py`).
+- **Rules** (`rules/*.py`, `pipeline.py`, `pipeline_config.py`) — pure logic over observations and
+  timestamps: presence, multiple people, framing, attention, camera covered/frozen/lost, identity,
+  objects, speech, whispering, microphone state, multiple voices. No model imports; every threshold
+  is in `pipeline_config.py` with its rationale.
+
+Every "sustained" behaviour is a **ratio over a time window with hysteresis** (`rules/episodes.py`),
+so one glance, blink or dropped frame can't fire or cancel it. See
+[`shepherd-ai/docs/ANTI_CHEAT.md`](../shepherd-ai/docs/ANTI_CHEAT.md) for the full alert catalogue,
+what each is worth, and privacy handling.
+
+**Evidence clips** (`evidence.py`): a rolling in-memory buffer (~12 small keyframes, ~8 s of audio).
+A clip is copied out only when a rule flags an alert as needing one, capped per session — never a
+continuous recording. shepherd-backend's relay strips the clip off the alert and stores it.
+
+**Identity** (`face_identity.py`): `ENROLL` validates check-in photos strictly and returns an
+*embedding*; the photos are not kept. The embedding lives in session memory only and is dropped when
+the connection closes.
+
 ## Two ways to run this
 
 **1. Local demo** (`main.py` / `facetracking.py`'s own `main()`) — opens your machine's webcam and
@@ -35,7 +61,7 @@ pip install -r requirements-service.txt
 uvicorn service:app --port 8901
 ```
 
-`GET /health` reports `{"status": "OK", "active_sessions": <n>}` — used by
+`GET /health` reports `{"status": "OK", "active_sessions": <n>, "models": "loading|ready", "capabilities": {identity, speaker_diarization, objects}, "unavailable": [...]}` — so you can see which detections are really available (e.g. speaker diarization is off if `onnxruntime` isn't installed) rather than silently getting no alerts. Also used by
 [`run-shepherd-stack.sh`](../run-shepherd-stack.sh)'s startup wait.
 
 ## Setup
@@ -60,6 +86,29 @@ isn't already present (it is, checked into this repo). `obd.py` loads `yolo26n.p
 in) at import time. Both add real latency to the very first request this service handles after a
 fresh start — this shows up as the service being slow to report `/health` as ready, not as an
 error.
+
+## Wire protocol additions
+
+Client → service: `ENROLL` (`{images: [b64 jpeg…]}` or `{embedding: […]}`) → `ENROLLMENT_RESULT`
+(`{ok, reason, faces_seen, embedding}`). Service → client: `AI_ALERT` now carries many more
+`alert_type`s and may include an `evidence` clip (which shepherd-backend replaces with an
+`evidence_id`). The service also sends its own watchdog alerts when video or audio stops arriving.
+
+## Tests
+
+```bash
+pytest tests --ignore=tests/smoke_test_service.py --ignore=tests/test_perception_integration.py \
+       --ignore=tests/test_audio_integration.py          # rules layer: light deps only, runs in <1 s
+pytest tests/smoke_test_service.py                       # real models, real WebSocket route (~1 min first time)
+
+# Real-media scenarios (skipped unless you point them at your own files):
+PROCTOR_TEST_FACES_DIR=/path pytest tests/test_perception_integration.py   # person_a.jpg, person_b.jpg
+PROCTOR_TEST_VOICES_DIR=/path pytest tests/test_audio_integration.py      # voice_a.wav, voice_b.wav (16 kHz mono)
+```
+
+Model files not checked into the repo (`face_detection_yunet`, `face_recognition_sface`, the
+speaker model) are downloaded to `./models/` on first use and **verified against a pinned SHA-256**
+(`model_assets.py`). Pre-populate `./models/` for air-gapped installs.
 
 ## What's additive vs. original
 

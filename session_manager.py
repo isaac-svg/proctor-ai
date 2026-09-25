@@ -1,141 +1,339 @@
 """
 Per-session state for the video-stream analysis service (service.py).
 
-main.py's local demo uses bare module-level globals (`state = {...}`,
-`active_flags = {}`) for exactly one implicit session -- the camera in front
-of it. A network service handling many exam-takers concurrently needs one
-HeadPoseEstimator/EventDetector/VAD-state per session_id instead, torn down
-when that session's connection closes. That's what this module adds; it
-doesn't change main.py's own demo loop at all.
+A ProctorSession is the glue between the two layers described in
+observations.py: it runs *perception* (MediaPipe pose, YOLO objects, YuNet/
+SFace identity, Silero VAD, speaker embeddings, image/audio statistics) to
+turn each JPEG / PCM chunk into observations, hands those to a
+`ProctorPipeline` (pure rules), and snapshots an evidence clip for any alert
+that asks for one.
+
+main.py's local demo is unaffected: it still uses events.py's original
+EventDetector directly.
 """
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, NamedTuple, Optional
 
 import cv2
 import numpy as np
 
-from events import EventDetector
-from facetracking import HeadPoseEstimator, PoseResult, gaze_bucket
-from obd import objectDetection
+from audio_features import analyze_window
+from evidence import EvidenceBuffer
+from face_identity import EnrollmentResult, FaceIdentityVerifier
+from facetracking import HeadPoseEstimator, PoseResult
+from frame_quality import compute_quality
+from obd import detect_objects
+from observations import (
+    AlertEvent,
+    BoundingBox,
+    FaceObservation,
+    FrameObservation,
+)
+from pipeline import ProctorPipeline
+from pipeline_config import PipelineConfig
+from speaker_embedding import MIN_SAMPLES as SPEAKER_MIN_SAMPLES
+from speaker_embedding import SpeakerEmbedder, load_speaker_embedder
 from vad import VoiceActivityDectector
 
-# obd.py's `model = YOLO(...)` is a single module-level instance shared by
-# every ProctorSession (loading YOLO weights per-session would be wasteful
-# and slow). Ultralytics' .predict() isn't guaranteed safe to call from
-# multiple threads concurrently against one shared model, and service.py
-# offloads each session's frame handling to a thread-pool executor (see its
-# own comments) -- so calls into it are serialized here rather than trusting
-# concurrent access to be safe.
-_obd_lock = threading.Lock()
+log = logging.getLogger("proctor-ai.session")
 
-# One VAD analysis per ~1s of buffered audio, matching vad.py's own
-# RATE/CHUNK constants (16kHz, s16le mono => 32000 bytes/second).
-_AUDIO_BYTES_PER_ANALYSIS = 16000 * 2
+# One VAD/feature window per second of buffered audio: 16 kHz * 2 bytes.
+_AUDIO_WINDOW_BYTES = 16000 * 2
+# Speaker embeddings need ~2 s of context to be reliable; embed the last two
+# windows whenever the current one is mostly speech.
+_SPEAKER_CONTEXT_BYTES = _AUDIO_WINDOW_BYTES * 2
 
-# Detected face count above 1 is itself worth surfacing (API_CONTRACTS.md
-# §3's MULTIPLE_PERSONS alert), so the estimator is asked for a few faces
-# even though only the primary one drives head-pose/gaze events.
+# Faces to look for: enough to notice a second and third person.
 _MAX_FACES = 3
+# Identity is scored on every Nth frame -- at ~1 frame/second that's every
+# couple of seconds, plenty for "is it still the same person".
+_IDENTITY_EVERY_N_FRAMES = 2
+
+
+class Emission(NamedTuple):
+    event: AlertEvent
+    clip: Optional[Dict[str, Any]]
+
+
+class SharedModels:
+    """Process-wide, lazily loaded model handles. Loading can fail (missing
+    optional dependency, no network for a first download); each failure is
+    recorded once and the affected capability is reported as off rather than
+    taking the whole service down."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._identity: Optional[FaceIdentityVerifier] = None
+        self._identity_tried = False
+        self._speaker: Optional[SpeakerEmbedder] = None
+        self._speaker_tried = False
+        self.errors: Dict[str, str] = {}
+
+    @property
+    def identity(self) -> Optional[FaceIdentityVerifier]:
+        with self._lock:
+            if not self._identity_tried:
+                self._identity_tried = True
+                try:
+                    self._identity = FaceIdentityVerifier()
+                except Exception as exc:
+                    self.errors["identity"] = str(exc)
+                    log.warning("identity verification unavailable: %s", exc)
+            return self._identity
+
+    @property
+    def speaker(self) -> Optional[SpeakerEmbedder]:
+        with self._lock:
+            if not self._speaker_tried:
+                self._speaker_tried = True
+                self._speaker = load_speaker_embedder()
+                if self._speaker is None:
+                    self.errors["speaker_diarization"] = "onnxruntime or model unavailable"
+            return self._speaker
+
+    def warm_up(self) -> None:
+        """Load everything now, so the first real frame doesn't pay for it."""
+        _ = self.identity
+        _ = self.speaker
+        try:
+            import obd
+
+            obd._get_model()
+        except Exception as exc:
+            self.errors["objects"] = str(exc)
+            log.warning("object detection unavailable: %s", exc)
+
+    def capabilities(self) -> Dict[str, bool]:
+        return {
+            "identity": self._identity is not None,
+            "speaker_diarization": self._speaker is not None,
+            "objects": "objects" not in self.errors,
+        }
 
 
 class ProctorSession:
-    """All per-session analysis state: one estimator, one event pipeline,
-    one rolling audio buffer. Not thread-safe on its own -- service.py is
-    responsible for not calling into the same session's methods concurrently
-    from two frames at once (a per-session asyncio.Lock, or simply not
-    awaiting two handlers for the same session_id in parallel)."""
+    """All per-session analysis state. Thread-safe: service.py runs video and
+    audio handling for one session on a thread pool, so both funnel through
+    `self._lock`."""
 
-    def __init__(self, session_id: str, frame_width: int = 640, frame_height: int = 480):
+    def __init__(
+        self,
+        session_id: str,
+        shared: SharedModels,
+        cfg: Optional[PipelineConfig] = None,
+        frame_width: int = 640,
+        frame_height: int = 480,
+        clock: Callable[[], float] = time.time,
+    ) -> None:
         self.session_id = session_id
-        self.estimator = HeadPoseEstimator(frame_width, frame_height, num_faces=_MAX_FACES)
-        self.detector = EventDetector()
-        self.obd = objectDetection()
-        self.vad = VoiceActivityDectector(open_stream=False)
+        self.cfg = cfg or PipelineConfig()
+        self.shared = shared
+        self._clock = clock
+        self._lock = threading.Lock()
 
-        self.state: Dict[str, Any] = {"is_speaking": False, "isCellphone_detected": False}
+        self.estimator = HeadPoseEstimator(frame_width, frame_height, num_faces=_MAX_FACES)
+        self.vad = VoiceActivityDectector(open_stream=False)
+        self.pipeline = ProctorPipeline(self.cfg)
+        self.evidence = EvidenceBuffer(self.cfg)
+
+        self._reference: Optional[List[float]] = None
+        self._prev_thumb: Optional[np.ndarray] = None
+        self._frame_count = 0
+        self._last_ms = 0
         self._audio_buffer = bytearray()
-        self.last_pose: Optional[PoseResult] = None
+        self._speech_tail = b""
         self.created_at = time.monotonic()
 
-    def on_video_frame(self, jpeg_bytes: bytes) -> List[Dict[str, Any]]:
-        """Decode one JPEG snapshot and run the full detection pipeline.
-        Returns raw events.py-shaped event dicts (map via alert_mapping.py
-        before sending as AI_ALERT)."""
-        arr = np.frombuffer(jpeg_bytes, dtype=np.uint8)
-        frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    # ------------------------------------------------------------------
+    # Identity enrollment
+    # ------------------------------------------------------------------
+    def enroll(self, jpegs: List[bytes]) -> EnrollmentResult:
+        """Validate check-in captures and return the candidate embedding. The
+        images are not retained."""
+        verifier = self.shared.identity
+        if verifier is None:
+            return EnrollmentResult(False, "identity_unavailable")
+        frames = []
+        for raw in jpegs[:5]:
+            img = cv2.imdecode(np.frombuffer(raw, dtype=np.uint8), cv2.IMREAD_COLOR)
+            if img is not None:
+                frames.append(img)
+        if not frames:
+            return EnrollmentResult(False, "no_valid_image")
+        result = verifier.enroll(frames)
+        if result.ok and result.embedding is not None:
+            self._reference = result.embedding
+        return result
+
+    def set_reference(self, embedding: List[float]) -> bool:
+        if not embedding or len(embedding) < 16 or not all(isinstance(x, (int, float)) for x in embedding):
+            return False
+        self._reference = [float(x) for x in embedding]
+        return True
+
+    @property
+    def has_reference(self) -> bool:
+        return self._reference is not None
+
+    # ------------------------------------------------------------------
+    # Video
+    # ------------------------------------------------------------------
+    def on_video_frame(self, jpeg_bytes: bytes) -> List[Emission]:
+        frame = cv2.imdecode(np.frombuffer(jpeg_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
         if frame is None:
             return []  # corrupt/partial JPEG -- drop this frame, not fatal
 
-        ts = time.time()
-        pose = self.estimator.process_frame(frame, int(ts * 1000))
-        self.last_pose = pose
+        ts = self._clock()
+        with self._lock:
+            self._frame_count += 1
+            try:
+                obs = self._observe_frame(frame, ts)
+            except Exception:
+                # One bad frame (or a model hiccup) must not end the exam's
+                # analysis, let alone the WebSocket: log it and carry on.
+                log.exception("frame analysis failed for session %s", self.session_id)
+                return []
+            self.evidence.add_frame(ts, frame)
+            return self._emit(self.pipeline.on_frame(obs))
 
-        with _obd_lock:
-            self.state["isCellphone_detected"] = self.obd.predict(frame)
+    def _observe_frame(self, frame: np.ndarray, ts: float) -> FrameObservation:
+        quality, self._prev_thumb = compute_quality(frame, self._prev_thumb)
 
-        # Deliberately the *only* call site for detector.update(): running
-        # it again from on_audio_chunk() with pose=None would make
-        # HeadPoseSubDetector reset its _away_start timer (it treats
-        # pose=None as "no face"), which would starve sustained_look_away
-        # of the continuous window it needs whenever an audio chunk lands
-        # between video frames. Audio-derived state (is_speaking) still
-        # feeds in below -- it's just folded into the next video-driven call
-        # rather than triggering its own.
-        return self.detector.update(pose=pose, state=self.state, ts=ts)
+        # MediaPipe VIDEO mode needs strictly increasing millisecond stamps.
+        ms = max(int(ts * 1000), self._last_ms + 1)
+        self._last_ms = ms
+        pose = self.estimator.process_frame(frame, ms)
+        faces = self._faces_from_pose(pose)
 
-    def on_audio_chunk(self, pcm_bytes: bytes) -> List[Dict[str, Any]]:
-        """Buffer raw PCM and update self.state['is_speaking'] once enough
-        has accumulated. Never calls detector.update() itself -- see
-        on_video_frame()'s comment for why. Always returns []; kept as a
-        list-returning method for symmetry with on_video_frame()."""
-        self._audio_buffer.extend(pcm_bytes)
-        if len(self._audio_buffer) >= _AUDIO_BYTES_PER_ANALYSIS:
-            chunk = bytes(self._audio_buffer[:_AUDIO_BYTES_PER_ANALYSIS])
-            del self._audio_buffer[:_AUDIO_BYTES_PER_ANALYSIS]
-            self.state["is_speaking"] = self.vad.analyze_pcm(chunk)
-        return []
+        try:
+            objects = detect_objects(frame)
+        except Exception as exc:  # a broken model must not silence every other rule
+            log.warning("object detection failed: %s", exc)
+            self.shared.errors["objects"] = str(exc)
+            objects = []
+
+        similarity, skipped = self._score_identity(frame, pose)
+        return FrameObservation(
+            ts=ts,
+            faces=faces,
+            objects=objects,
+            quality=quality,
+            identity_similarity=similarity,
+            identity_skipped_reason=skipped,
+        )
+
+    @staticmethod
+    def _faces_from_pose(pose: PoseResult) -> List[FaceObservation]:
+        if not pose.face_found or not pose.face_boxes:
+            return []
+        faces: List[FaceObservation] = []
+        for i, b in enumerate(pose.face_boxes):
+            box = BoundingBox(b["x"], b["y"], b["width"], b["height"])
+            if i == 0:  # pose is only estimated for the primary (largest) face
+                faces.append(
+                    FaceObservation(
+                        box=box,
+                        yaw=pose.yaw,
+                        pitch=pose.pitch,
+                        roll=pose.roll,
+                        gaze_x=pose.gaze_x,
+                        gaze_y=pose.gaze_y,
+                    )
+                )
+            else:
+                faces.append(FaceObservation(box=box))
+        return faces
+
+    def _score_identity(self, frame: np.ndarray, pose: PoseResult) -> tuple[Optional[float], Optional[str]]:
+        if self._reference is None:
+            return None, None
+        if self._frame_count % _IDENTITY_EVERY_N_FRAMES:
+            return None, None
+        if not pose.face_found:
+            return None, "no_face"
+        cfg = self.cfg
+        if abs(pose.yaw) > cfg.identity_max_yaw_deg or abs(pose.pitch) > cfg.identity_max_pitch_deg:
+            return None, "face_not_frontal"
+        verifier = self.shared.identity
+        if verifier is None:
+            return None, "identity_unavailable"
+        try:
+            return verifier.score(
+                frame,
+                self._reference,
+                min_sharpness=cfg.identity_min_sharpness,
+                min_area=cfg.identity_min_face_area,
+                max_yaw_ratio=0.35,
+            )
+        except Exception as exc:
+            log.warning("identity scoring failed: %s", exc)
+            return None, "error"
+
+    # ------------------------------------------------------------------
+    # Audio
+    # ------------------------------------------------------------------
+    def on_audio_chunk(self, pcm_bytes: bytes) -> List[Emission]:
+        out: List[Emission] = []
+        with self._lock:
+            self._audio_buffer.extend(pcm_bytes)
+            while len(self._audio_buffer) >= _AUDIO_WINDOW_BYTES:
+                window = bytes(self._audio_buffer[:_AUDIO_WINDOW_BYTES])
+                del self._audio_buffer[:_AUDIO_WINDOW_BYTES]
+                out += self._process_audio_window(window)
+        return out
+
+    def _process_audio_window(self, window: bytes) -> List[Emission]:
+        ts = self._clock()
+        try:
+            speech_ratio = self.vad.speech_ratio(window)
+        except Exception:
+            log.exception("VAD failed for session %s", self.session_id)
+            speech_ratio = 0.0
+        self._speech_tail = (self._speech_tail + window)[-_SPEAKER_CONTEXT_BYTES:]
+
+        embedding = None
+        if speech_ratio >= self.cfg.voice_min_speech_ratio and len(self._speech_tail) >= SPEAKER_MIN_SAMPLES * 2:
+            speaker = self.shared.speaker
+            if speaker is not None:
+                try:
+                    embedding = speaker.embed(self._speech_tail)
+                except Exception as exc:
+                    log.warning("speaker embedding failed: %s", exc)
+
+        self.evidence.add_audio(ts, window)
+        obs = analyze_window(window, ts, speech_ratio=speech_ratio, speaker_embedding=embedding)
+        return self._emit(self.pipeline.on_audio(obs))
+
+    # ------------------------------------------------------------------
+    def on_tick(self) -> List[Emission]:
+        with self._lock:
+            return self._emit(self.pipeline.on_tick(self._clock()))
 
     def analysis_snapshot(self) -> Dict[str, Any]:
-        """A cheap instantaneous heuristic for the periodic AI_ANALYSIS
-        message -- NOT the persisted cheat score (that's shepherd-backend's
-        risk-score.ts, computed from accumulated evidence_events instead)."""
-        pose = self.last_pose
-        if pose is None or not pose.face_found:
-            return {
-                "faces_detected": 0,
-                "persons_in_frame": 0,
-                "gaze_direction": "CENTER",
-                "head_pose": {"yaw": 0, "pitch": 0, "roll": 0},
-                "risk_score": 0.0,
-            }
+        with self._lock:
+            snap = self.pipeline.snapshot()
+        snap["identity_enrolled"] = self.has_reference
+        return snap
 
-        turned = abs(pose.yaw) > self.detector.cfg.yaw_threshold_deg or abs(
-            pose.pitch
-        ) > self.detector.cfg.pitch_threshold_deg
-        gaze_off = gaze_bucket(pose.gaze_x, pose.gaze_y) != "CENTER"
-        phone = bool(self.state.get("isCellphone_detected", False))
-        risk = min(1.0, 0.3 * turned + 0.3 * gaze_off + 0.4 * phone)
-
-        return {
-            "faces_detected": pose.num_faces,
-            "persons_in_frame": pose.num_faces,
-            "face_bounding_box": pose.face_bounding_box,
-            "gaze_direction": gaze_bucket(pose.gaze_x, pose.gaze_y),
-            "head_pose": {"yaw": pose.yaw, "pitch": pose.pitch, "roll": pose.roll},
-            "risk_score": risk,
-        }
+    def _emit(self, events: List[AlertEvent]) -> List[Emission]:
+        return [Emission(e, self.evidence.build(e)) for e in events]
 
     def close(self) -> None:
         self.estimator.close()
         self.vad.close()
+        # The reference embedding is biometric data: drop it eagerly rather
+        # than waiting for garbage collection.
+        self._reference = None
 
 
 class ProctorSessionManager:
-    def __init__(self):
+    def __init__(self, shared: Optional[SharedModels] = None) -> None:
+        self.shared = shared or SharedModels()
         self._sessions: Dict[str, ProctorSession] = {}
         self._lock = threading.Lock()
 
@@ -143,7 +341,7 @@ class ProctorSessionManager:
         with self._lock:
             session = self._sessions.get(session_id)
             if session is None:
-                session = ProctorSession(session_id)
+                session = ProctorSession(session_id, self.shared)
                 self._sessions[session_id] = session
             return session
 
