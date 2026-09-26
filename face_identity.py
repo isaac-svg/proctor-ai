@@ -128,6 +128,27 @@ class FaceIdentityVerifier:
         return None
 
     # ------------------------------------------------------------------
+    def embed_primary(
+        self, frame_bgr: np.ndarray, min_sharpness: float, min_area: float, max_yaw_ratio: float
+    ) -> tuple[Optional[List[float]], Optional[str]]:
+        """(embedding, None) of the largest face, or (None, reason_skipped) when the frame is not good enough
+        to judge. Used both to compare against the check-in reference and, independently, against the
+        face seen earlier in the same exam."""
+        with self.lock:
+            faces = self._detect(frame_bgr)
+            if len(faces) == 0:
+                return None, "no_face"
+            row = faces[0]
+            h, w = frame_bgr.shape[:2]
+            if (row[2] * row[3]) / float(w * h) < min_area:
+                return None, "face_too_small"
+            if _yaw_ratio(row) > max_yaw_ratio:
+                return None, "face_not_frontal"
+            gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+            if cv2.Laplacian(gray, cv2.CV_64F).var() < min_sharpness:
+                return None, "too_blurry"
+            return [float(x) for x in self._embed_row(frame_bgr, row)], None
+
     def score(
         self, frame_bgr: np.ndarray, reference: Sequence[float], min_sharpness: float, min_area: float, max_yaw_ratio: float
     ) -> tuple[Optional[float], Optional[str]]:

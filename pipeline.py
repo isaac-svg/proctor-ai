@@ -65,13 +65,27 @@ class ProctorPipeline:
         if self.camera_covered.is_covered:
             return events
 
-        events += self.presence.on_frame(obs)
+        presence_events = self.presence.on_frame(obs)
+        events += presence_events
+        for e in presence_events:
+            if e.alert_type == "FACE_RETURNED":
+                # Whoever came back is compared with whoever left, with a shorter run of evidence.
+                self.identity.on_face_returned(obs.ts, float(e.details.get("absent_seconds", 0.0)))
         events += self.multiple.on_frame(obs)
         events += self.framing.on_frame(obs)
         events += self.attention.on_frame(obs)
         events += self.identity.on_frame(obs)
         events += self.objects.on_frame(obs)
         return events
+
+    def annotations(self) -> List[tuple]:
+        """Boxes worth marking on the evidence frame for the observation just processed: confirmed prohibited
+        objects, and -- while more than one person is in view -- the people, so a reviewer can see who was counted."""
+        marks: List[tuple] = list(self.objects.confirmed_boxes())
+        f = self._last_frame
+        if f is not None and self.multiple.person_count >= 2:
+            marks += [("person", p.box) for p in f.persons if p.confidence >= self.cfg.person_min_confidence and p.box.area >= self.cfg.person_min_area]
+        return marks
 
     def on_audio(self, obs: AudioObservation) -> List[AlertEvent]:
         self._last_audio = obs

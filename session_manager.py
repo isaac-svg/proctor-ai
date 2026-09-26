@@ -24,7 +24,7 @@ import numpy as np
 
 from audio_features import analyze_window
 from evidence import EvidenceBuffer
-from face_identity import EnrollmentResult, FaceIdentityVerifier
+from face_identity import EnrollmentResult, FaceIdentityVerifier, cosine
 from facetracking import HeadPoseEstimator, PoseResult
 from frame_quality import compute_quality
 from obd import detect_objects
@@ -217,8 +217,10 @@ class ProctorSession:
                 # analysis, let alone the WebSocket: log it and carry on.
                 log.exception("frame analysis failed for session %s", self.session_id)
                 return []
-            self.evidence.add_frame(ts, frame)
-            return self._emit(self.pipeline.on_frame(obs))
+            events = self.pipeline.on_frame(obs)
+            # After the rules ran, so the boxes drawn on the stored thumbnail are the ones just confirmed.
+            self.evidence.add_frame(ts, frame, self.pipeline.annotations())
+            return self._emit(events)
 
     def _observe_frame(self, frame: np.ndarray, ts: float) -> FrameObservation:
         quality, self._prev_thumb = compute_quality(frame, self._prev_thumb)
@@ -236,7 +238,7 @@ class ProctorSession:
             self.shared.errors["objects"] = str(exc)
             objects = []
 
-        similarity, skipped = self._score_identity(frame, pose)
+        similarity, skipped, embedding = self._score_identity(frame, pose)
         return FrameObservation(
             ts=ts,
             faces=faces,
@@ -244,6 +246,7 @@ class ProctorSession:
             quality=quality,
             identity_similarity=similarity,
             identity_skipped_reason=skipped,
+            identity_embedding=embedding,
         )
 
     @staticmethod
@@ -268,30 +271,36 @@ class ProctorSession:
                 faces.append(FaceObservation(box=box))
         return faces
 
-    def _score_identity(self, frame: np.ndarray, pose: PoseResult) -> tuple[Optional[float], Optional[str]]:
-        if self._reference is None:
-            return None, None
+    def _score_identity(self, frame: np.ndarray, pose: PoseResult) -> tuple[Optional[float], Optional[str], Optional[List[float]]]:
+        """(similarity to the check-in reference, why it was skipped, the face's embedding).
+
+        The embedding is computed whether or not anyone enrolled: it is what lets the rules notice that the
+        person at the desk *changed* during the exam. The similarity to the reference is derived from the same
+        embedding, so a frame costs one recognition, not two."""
         if self._frame_count % _IDENTITY_EVERY_N_FRAMES:
-            return None, None
+            return None, None, None
         if not pose.face_found:
-            return None, "no_face"
+            return None, "no_face", None
         cfg = self.cfg
         if abs(pose.yaw) > cfg.identity_max_yaw_deg or abs(pose.pitch) > cfg.identity_max_pitch_deg:
-            return None, "face_not_frontal"
+            return None, "face_not_frontal", None
         verifier = self.shared.identity
         if verifier is None:
-            return None, "identity_unavailable"
+            return None, "identity_unavailable", None
         try:
-            return verifier.score(
+            embedding, skipped = verifier.embed_primary(
                 frame,
-                self._reference,
                 min_sharpness=cfg.identity_min_sharpness,
                 min_area=cfg.identity_min_face_area,
                 max_yaw_ratio=0.35,
             )
         except Exception as exc:
             log.warning("identity scoring failed: %s", exc)
-            return None, "error"
+            return None, "error", None
+        if embedding is None:
+            return None, skipped, None
+        similarity = cosine(embedding, self._reference) if self._reference is not None else None
+        return similarity, None, embedding
 
     # ------------------------------------------------------------------
     # Audio

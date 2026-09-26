@@ -36,6 +36,16 @@ class LookAwayRule:
         self._episodes = RollingCounter(cfg.frequent_look_away_window_s)
         self._gate = AlertGate()
 
+    def _direction(self, obs: FrameObservation) -> str:
+        """Which way the head is turned, for the reviewer: looking down (at a lap, a desk, a phone) reads very
+        differently from glancing sideways."""
+        p = obs.primary
+        if p is None:
+            return "unknown"
+        if abs(p.pitch) > self.cfg.pitch_threshold_deg and abs(p.pitch) >= abs(p.yaw) * (self.cfg.pitch_threshold_deg / self.cfg.yaw_threshold_deg):
+            return "down" if p.pitch < 0 else "up"
+        return "left" if p.yaw < 0 else "right"
+
     def _head_turned(self, obs: FrameObservation) -> bool:
         p = obs.primary
         if p is None:
@@ -71,6 +81,7 @@ class LookAwayRule:
                     details={
                         "yaw": round(primary.yaw, 1),
                         "pitch": round(primary.pitch, 1),
+                        "direction": self._direction(obs),
                         "since": self._head.active_since,
                     },
                     evidence=False,

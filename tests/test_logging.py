@@ -72,9 +72,9 @@ def test_a_field_cannot_overwrite_the_core_keys():
 
 def test_secrets_and_embeddings_are_redacted_at_any_depth():
     lg, out = _logger()
-    log_event(lg, logging.INFO, "x", body={"user": "a", "password": "hunter2", "n": [{"token": "eyJ.secret"}]}, embedding=[0.1] * 128)
+    log_event(lg, logging.INFO, "x", body={"user": "a", "password": "hunter2", "n": [{"token": "eyJ.secret"}]}, embedding=[0.7391] * 128)
     raw = out.getvalue()
-    for leaked in ("hunter2", "eyJ.secret", "0.1"):
+    for leaked in ("hunter2", "eyJ.secret", "0.7391"):
         assert leaked not in raw
     assert "[REDACTED]" in raw and '"user": "a"' in raw
 

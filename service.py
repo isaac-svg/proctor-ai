@@ -43,6 +43,7 @@ from logging_setup import configure_logging, log_event, session_id_var  # noqa: 
 configure_logging()
 
 from alert_mapping import alert_to_message
+import obd
 from session_manager import Emission, ProctorSessionManager, SharedModels
 
 log = logging.getLogger("proctor-ai")
@@ -143,6 +144,8 @@ def health(response: Response) -> Dict[str, Any]:
         "active_sessions": manager.count(),
         "models": _warm["state"],
         "capabilities": capabilities,
+        # Which object model and settings are really running (an operator can change them by environment).
+        "object_detection": obd.describe(),
         "unavailable": sorted(manager.shared.errors),
         "errors": dict(manager.shared.errors),
         "uptime_seconds": int(time.time() - _STARTED_AT),

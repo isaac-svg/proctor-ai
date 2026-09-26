@@ -19,12 +19,12 @@ import io
 import uuid
 import wave
 from collections import deque
-from typing import Any, Deque, Dict, Optional, Tuple
+from typing import Any, Deque, Dict, List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
 
-from observations import SEVERITIES, AlertEvent
+from observations import SEVERITIES, AlertEvent, BoundingBox
 from pipeline_config import PipelineConfig
 
 _SAMPLE_RATE = 16000
@@ -37,6 +37,30 @@ def _rank(severity: str) -> int:
     return SEVERITIES.index(severity)
 
 
+# Marker colour (BGR): a saturated orange-red that stands out on a webcam image without hiding it.
+_MARK = (40, 90, 255)
+
+
+def draw_annotations(frame_bgr: np.ndarray, annotations: Sequence[Tuple[str, BoundingBox]]) -> np.ndarray:
+    """A copy of `frame_bgr` with each labelled box drawn on it."""
+    out = frame_bgr.copy()
+    h, w = out.shape[:2]
+    for label, box in annotations:
+        x1 = int(max(0.0, box.x) * w)
+        y1 = int(max(0.0, box.y) * h)
+        x2 = int(min(1.0, box.x + box.width) * w)
+        y2 = int(min(1.0, box.y + box.height) * h)
+        if x2 <= x1 or y2 <= y1:
+            continue
+        cv2.rectangle(out, (x1, y1), (x2, y2), _MARK, 2)
+        text = label.upper()
+        (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)
+        top = max(0, y1 - th - 6)
+        cv2.rectangle(out, (x1, top), (min(w - 1, x1 + tw + 6), top + th + 6), _MARK, -1)
+        cv2.putText(out, text, (x1 + 3, top + th + 1), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
+    return out
+
+
 class EvidenceBuffer:
     def __init__(self, cfg: PipelineConfig) -> None:
         self.cfg = cfg
@@ -47,10 +71,15 @@ class EvidenceBuffer:
         self.attached = 0
 
     # ------------------------------------------------------------------
-    def add_frame(self, ts: float, frame_bgr: np.ndarray) -> None:
+    def add_frame(self, ts: float, frame_bgr: np.ndarray, annotations: Sequence[Tuple[str, BoundingBox]] = ()) -> None:
+        """Keeps a small copy of the frame. `annotations` are boxes (label, normalised box) drawn onto that
+        copy -- the phone, the second person -- so a reviewer sees *what* was detected without having to find
+        it. Only the stored thumbnail is marked; the analysed frame is untouched."""
         h, w = frame_bgr.shape[:2]
         if w > _FRAME_WIDTH:
             frame_bgr = cv2.resize(frame_bgr, (_FRAME_WIDTH, max(1, int(h * _FRAME_WIDTH / w))), interpolation=cv2.INTER_AREA)
+        if annotations:
+            frame_bgr = draw_annotations(frame_bgr, annotations)
         ok, buf = cv2.imencode(".jpg", frame_bgr, [cv2.IMWRITE_JPEG_QUALITY, _JPEG_QUALITY])
         if ok:
             self._frames.append((ts, buf.tobytes()))

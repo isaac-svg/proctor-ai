@@ -37,6 +37,33 @@ continuous recording. shepherd-backend's relay strips the clip off the alert and
 *embedding*; the photos are not kept. The embedding lives in session memory only and is dropped when
 the connection closes.
 
+## Detection robustness
+
+**Objects** (`obd.py`, `rules/object_tracker.py`, `rules/objects.py`). Each frame is analysed at a higher
+resolution (`PROCTOR_YOLO_IMGSZ`, default 960) and a second time over the lower part of the frame, where hands and
+phones are (`PROCTOR_OBJECT_SECOND_PASS`, default on); boxes are merged and implausible sizes dropped. Detections are
+then *tracked* from frame to frame: a phone is reported when its track has been seen in 2 of the last 5 frames with
+confidences that add up, or once in a single very confident sighting. That tolerates a half-hidden phone that the
+detector only catches every other frame, and still ignores a one-frame ghost. Alerts say where the object is, how
+long it has been followed, and whether it is held to the face, and the evidence frames have the box drawn on them.
+
+- Bigger model: `PROCTOR_YOLO_MODEL=yolo26s.pt` (or a path). `/health` shows what is really running.
+- Things COCO does not know (earbuds, headphones, smartwatch, tablet, notes, calculator): the rules already have
+  entries for them, but **no weights are shipped**. Provide a YOLO model that detects them and map its class names:
+  `PROCTOR_EXTRA_MODEL=/path/extra.pt PROCTOR_EXTRA_LABELS='{"earbud":"earbuds","watch":"smartwatch"}'`. Without one
+  those labels simply never appear.
+
+**Person change** (`rules/identity.py`). Two independent checks. `IDENTITY_MISMATCH`: the face now against the
+check-in photo. `PERSON_CHANGED`: the face now against *this session's own history* (a running model of the candidate
+built from the exam so far), which needs no enrolment and is far stricter because it compares the same camera, room
+and light. Right after the candidate has left the frame a shorter run of evidence is enough, since that is the classic
+swap. If the face no longer matches the photo but is clearly the person who has been at the desk (and was verified
+against the photo earlier), the result is `APPEARANCE_CHANGED` (glasses, a mask, lighting) for a human to look at, not a
+critical accusation. A swap raises one alert, not several.
+
+**Not built:** blink/liveness detection. Frames arrive about once a second and a blink lasts a fraction of that, so it
+cannot be observed reliably at this frame rate. Anything sold as liveness here would be a guess.
+
 ## Two ways to run this
 
 **1. Local demo** (`main.py` / `facetracking.py`'s own `main()`) — opens your machine's webcam and

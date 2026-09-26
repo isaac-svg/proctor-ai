@@ -78,6 +78,8 @@ class ObjectObservation:
     label: str  # COCO class name, e.g. "cell phone", "person", "book"
     confidence: float
     box: BoundingBox
+    # Which model / pass produced it ("main", "hands", "extra"), for review and tuning.
+    source: str = "main"
 
 
 @dataclass
@@ -107,6 +109,11 @@ class FrameObservation:
     # face was unusable (turned away, too small, blurry) -- distinguishes
     # "no data" from "different person".
     identity_skipped_reason: Optional[str] = None
+    # L2-normalised embedding of the primary face, on frames where one could be
+    # computed reliably (frontal, large, sharp). Independent of any enrolled
+    # reference: it lets the rules notice that the person at the desk *changed*
+    # during the exam even when nobody enrolled at check-in.
+    identity_embedding: Optional[List[float]] = None
 
     @property
     def primary(self) -> Optional[FaceObservation]:

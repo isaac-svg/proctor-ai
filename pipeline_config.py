@@ -110,6 +110,21 @@ class PipelineConfig:
     identity_max_pitch_deg: float = 25.0
     identity_min_face_area: float = 0.03
     identity_min_sharpness: float = 25.0
+    # Continuity: is the person at the desk the same one as a few minutes ago?
+    # Needs no enrolment, and is a far stricter test than matching the check-in
+    # photo, because it compares two moments of the *same session* (same camera,
+    # same room, same lighting): the same person lands at 0.5-0.9 there, so a
+    # score below `continuity_change_below` is a genuinely different face.
+    continuity_bootstrap: int = 4
+    continuity_same_above: float = 0.50
+    continuity_change_below: float = 0.35
+    continuity_consecutive: int = 3
+    # Right after the candidate has been out of frame the swap is the classic
+    # cheat, so a shorter run is enough.
+    continuity_after_absence_consecutive: int = 2
+    continuity_after_absence_window_s: float = 60.0
+    continuity_update_alpha: float = 0.10
+    person_change_cooldown_s: float = 120.0
 
     # ------------------------------------------------------------------
     # Objects
@@ -119,18 +134,39 @@ class PipelineConfig:
     # has books, and a second laptop in frame is suspicious but not proof.
     object_rules: Dict[str, tuple] = field(
         default_factory=lambda: {
-            "cell phone": (0.35, "HIGH"),
+            "cell phone": (0.30, "HIGH"),
             "book": (0.45, "MEDIUM"),
             "laptop": (0.50, "MEDIUM"),
+            # The labels below are not in the stock COCO model. They are reported
+            # only when an extra model that knows them is loaded (obd.py,
+            # PROCTOR_EXTRA_MODEL); with the stock model they simply never appear.
+            "tablet": (0.50, "HIGH"),
+            "earbuds": (0.45, "HIGH"),
+            "headphones": (0.50, "MEDIUM"),
+            "smartwatch": (0.50, "MEDIUM"),
+            "notes": (0.50, "MEDIUM"),
+            "calculator": (0.50, "LOW"),
         }
     )
-    # Confirmed when seen in at least `object_confirm_hits` of the last
-    # `object_confirm_window` frames -- a single YOLO false positive is
-    # common at low confidence.
+    # A detection is followed from frame to frame (rules/object_tracker.py) and
+    # confirmed when its track has been seen in at least `object_confirm_hits`
+    # of the last `object_confirm_window` frames AND the confidences add up to
+    # `object_confirm_score` (two 0.35 sightings = 0.70, one 0.5 ghost is not
+    # enough) -- OR when a single sighting is confident enough on its own.
+    # Phones are often seen only intermittently (half hidden by a hand), which
+    # is why the window is wider than the hits needed.
     object_confirm_hits: int = 2
-    object_confirm_window: int = 3
+    object_confirm_window: int = 5
+    object_confirm_score: float = 0.70
+    object_single_shot_confidence: float = 0.85
+    object_track_iou: float = 0.20
+    object_track_max_gap_s: float = 4.0
     object_cooldown_s: float = 60.0
     phone_sustained_s: float = 3.0
+    # An object whose centre is within this many face-heights of the face is being
+    # held up to it. Recorded in the alert; a phone at the ear is not the same as
+    # a phone on the desk.
+    near_face_distance: float = 1.6
 
     # ------------------------------------------------------------------
     # Audio
