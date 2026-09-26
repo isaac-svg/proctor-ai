@@ -9,7 +9,7 @@ thread-safe on a shared model, so calls are serialised here.
 
 What makes this more robust than one plain pass:
 
-  * **Higher input resolution** (`PROCTOR_YOLO_IMGSZ`, default 960). A phone in
+  * **Higher input resolution** (`PROCTOR_YOLO_IMGSZ`, default 800). A phone in
     a hand is a few percent of a 640x480 webcam frame; the stock 640 input
     shrinks it to a handful of pixels.
   * **A second pass over the lower part of the frame** (`PROCTOR_OBJECT_SECOND_PASS`,
@@ -80,7 +80,7 @@ def _env_bool(name: str, default: bool) -> bool:
 
 
 def settings() -> Dict[str, Any]:
-    imgsz = int(os.environ.get("PROCTOR_YOLO_IMGSZ", "960") or 960)
+    imgsz = int(os.environ.get("PROCTOR_YOLO_IMGSZ", "800") or 800)
     extra_labels: Dict[str, str] = {}
     raw = os.environ.get("PROCTOR_EXTRA_LABELS", "")
     if raw:

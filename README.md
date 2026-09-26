@@ -40,13 +40,18 @@ the connection closes.
 ## Detection robustness
 
 **Objects** (`obd.py`, `rules/object_tracker.py`, `rules/objects.py`). Each frame is analysed at a higher
-resolution (`PROCTOR_YOLO_IMGSZ`, default 960) and a second time over the lower part of the frame, where hands and
+resolution (`PROCTOR_YOLO_IMGSZ`, default 800) and a second time over the lower part of the frame, where hands and
 phones are (`PROCTOR_OBJECT_SECOND_PASS`, default on); boxes are merged and implausible sizes dropped. Detections are
 then *tracked* from frame to frame: a phone is reported when its track has been seen in 2 of the last 5 frames with
 confidences that add up, or once in a single very confident sighting. That tolerates a half-hidden phone that the
 detector only catches every other frame, and still ignores a one-frame ghost. Alerts say where the object is, how
 long it has been followed, and whether it is held to the face, and the evidence frames have the box drawn on them.
 
+- **Cost.** Measured on one CPU core-set of a laptop, per 640x480 frame with the stock nano model: 158 ms for the old single
+  640 pass; 284 ms at 640 with the second pass; 364 ms at 960 single pass; 572 ms at 960 with the second pass. At one frame a
+  second per candidate that is roughly 0.15 to 0.6 of a core each, so size the service for it, and lower
+  `PROCTOR_YOLO_IMGSZ` / turn the second pass off (`PROCTOR_OBJECT_SECOND_PASS=0`) if analysis falls behind
+  (`/health` and the `slow_frame` log say so). The default (800, both passes) is a middle setting.
 - Bigger model: `PROCTOR_YOLO_MODEL=yolo26s.pt` (or a path). `/health` shows what is really running.
 - Things COCO does not know (earbuds, headphones, smartwatch, tablet, notes, calculator): the rules already have
   entries for them, but **no weights are shipped**. Provide a YOLO model that detects them and map its class names:
